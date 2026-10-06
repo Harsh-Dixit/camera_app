@@ -35,6 +35,7 @@ class SosCaptureSettings {
   late int postEventDurationSeconds;
   late int frameRate;
   late int videoBitRate;
+  late bool combinedVideoEnabled;
 }
 
 /// Native camera operations exposed to Flutter through Pigeon.
@@ -59,6 +60,10 @@ abstract class CameraHostApi {
   /// Returns the number of pre-event seconds retained for every active camera.
   @async
   int getBufferingSeconds();
+
+  /// Returns the current SOS save progress from 0 to 100.
+  @async
+  int getSosProgress();
 
   /// Saves pre-event footage and records the configured post-event duration.
   @async

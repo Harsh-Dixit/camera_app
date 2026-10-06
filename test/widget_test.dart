@@ -1,4 +1,5 @@
 import 'package:camera_app/src/app.dart';
+import 'package:camera_app/src/camera/capture_settings.dart';
 import 'package:camera_app/src/widgets/camera_card.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -12,11 +13,18 @@ void main() {
     (tester) async {
       final service = FakeCameraService();
       await tester.pumpWidget(
-        MultiCameraRecorderApp(cameraService: service, isAndroidPlatform: true),
+        MultiCameraRecorderApp(
+          cameraService: service,
+          isAndroidPlatform: true,
+          captureSettings: const CaptureSettings(combinedVideoEnabled: true),
+        ),
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('3 cameras detected'), findsOneWidget);
+      expect(
+        find.text('3 available cameras · phone and Camera2 USB devices'),
+        findsOneWidget,
+      );
       expect(find.text('0 of 3 cameras selected'), findsOneWidget);
 
       await tester.tap(find.text('Select all'));
@@ -27,6 +35,7 @@ void main() {
         'back',
         'usb',
       });
+      expect(find.text('USB / external camera'), findsOneWidget);
 
       await tester.tap(find.text('Start SOS monitoring'));
       await tester.pumpAndSettle();
@@ -40,7 +49,16 @@ void main() {
 
       await tester.tap(find.text('SOS · 30s BEFORE + 30s AFTER'));
       await tester.pumpAndSettle();
-      expect(find.text('Saved 3 separate SOS videos.'), findsOneWidget);
+      expect(
+        find.textContaining(
+          'SOS #1 saved: 3 separate videos and combined front/back video:',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('/movies/camera_combined.mp4'),
+        findsOneWidget,
+      );
       expect(find.byType(CameraCard), findsAtLeastNWidgets(1));
       expect(
         find.textContaining('Saved: /movies/camera_front.mp4'),
@@ -58,7 +76,16 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(usbVideoPath, findsOneWidget);
-      expect(service.sosRequests, 1);
+
+      for (var capture = 0; capture < 2; capture++) {
+        await tester.tap(find.text('SOS · 30s BEFORE + 30s AFTER'));
+        await tester.pumpAndSettle();
+      }
+      expect(service.sosRequests, 3);
+      expect(
+        find.textContaining('Saved 3 SOS captures · latest:'),
+        findsOneWidget,
+      );
     },
   );
 

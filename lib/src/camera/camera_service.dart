@@ -12,12 +12,11 @@ abstract interface class CameraService {
 
   Future<void> setPreviewCameras(List<String> cameraIds);
 
-  Future<void> startBuffering(
-    List<String> cameraIds,
-    CaptureSettings settings,
-  );
+  Future<void> startBuffering(List<String> cameraIds, CaptureSettings settings);
 
   Future<int> getBufferingSeconds();
+
+  Future<int> getSosProgress();
 
   Future<List<CameraRecordingInfo>> triggerSos();
 
@@ -55,6 +54,10 @@ class PigeonCameraService implements CameraService {
   /// Reports seconds of pre-event footage currently available.
   @override
   Future<int> getBufferingSeconds() => _api.getBufferingSeconds();
+
+  /// Reports save progress for the active SOS request.
+  @override
+  Future<int> getSosProgress() => _api.getSosProgress();
 
   /// Creates a per-camera SOS clip with pre-event and post-event footage.
   @override

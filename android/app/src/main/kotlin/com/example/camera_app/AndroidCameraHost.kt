@@ -4,6 +4,11 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
@@ -12,6 +17,10 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.media.MediaExtractor
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
+import android.media.MediaMetadataRetriever
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaRecorder
@@ -31,6 +40,7 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -75,6 +85,8 @@ internal class AndroidCameraHost(
     private var settings: SosCaptureSettings? = null
     private var bufferCameraIds: Set<String> = emptySet()
     private var sosInProgress = false
+    @Volatile
+    private var sosProgress = 0
 
     /** Returns immediately for an existing grant or waits for Android's dialog. */
     override suspend fun requestCameraPermission(): Boolean {
@@ -114,7 +126,10 @@ internal class AndroidCameraHost(
         }
     }
 
-    /** Finds Camera2 devices and creates one Flutter texture for each device. */
+    /**
+     * Lists every camera Android exposes through Camera2, including external
+     * USB cameras, and creates a preview texture for each camera.
+     */
     override suspend fun listCameras(): List<CameraDeviceInfo> {
         ensureCameraPermission()
         removeStaleTemporarySegments()
@@ -250,6 +265,9 @@ internal class AndroidCameraHost(
         }
     }
 
+    /** Reports native progress while an SOS request is recording or being assembled. */
+    override suspend fun getSosProgress(): Long = sosProgress.toLong()
+
     /** Saves available pre-event footage and then records the post-event window. */
     override suspend fun triggerSos(): List<CameraRecordingInfo> {
         val captureSettings = settings
@@ -277,38 +295,67 @@ internal class AndroidCameraHost(
         }
 
         sosInProgress = true
+        sosProgress = 0
+        var sosSaved = false
         active.forEach { resource ->
             resource.protectedWindowStartMs = eventWindowStarts.getValue(resource)
         }
-        try {
-            active.forEach { resource ->
-                rotateSegment(resource, MINIMUM_SEGMENT_DURATION_MS)
-            }
-            // Start the post-event clock when fresh segments are rolling, so
-            // camera startup/segment-finalization time is not taken off the
-            // requested future recording window.
+        return try {
+            // Use the normal segment rotation loop instead of rebuilding both
+            // camera sessions at SOS time. Reconfiguring concurrent sessions
+            // here can freeze a preview on some OEM camera providers.
             val eventEndMs =
-                SystemClock.elapsedRealtime() +
-                    captureSettings.postEventDurationSeconds * 1000L
+                eventStartMs + captureSettings.postEventDurationSeconds * 1000L
             while (SystemClock.elapsedRealtime() < eventEndMs) {
-                delay((eventEndMs - SystemClock.elapsedRealtime()).coerceAtLeast(1L))
+                val elapsedMs = SystemClock.elapsedRealtime() - eventStartMs
+                sosProgress = (
+                    5L + elapsedMs * 45L /
+                        (captureSettings.postEventDurationSeconds * 1000L)
+                    ).toInt().coerceIn(5, 50)
+                delay((eventEndMs - SystemClock.elapsedRealtime()).coerceAtMost(250L).coerceAtLeast(1L))
             }
-            active.forEach { resource ->
-                rotateSegment(resource, MINIMUM_SEGMENT_DURATION_MS)
+            sosProgress = 50
+
+            while (true) {
+                val waitingForFinalizedSegment = active.filter { resource ->
+                    resource.segmentMutex.withLock {
+                        resource.segmentFiles.none { segment ->
+                            segment.endTimeMs >= eventEndMs
+                        }
+                    }
+                }
+                if (waitingForFinalizedSegment.isEmpty()) break
+                waitingForFinalizedSegment.firstNotNullOfOrNull(CameraResource::bufferError)
+                    ?.let { error ->
+                        throw IllegalStateException(
+                            "A camera stopped before the SOS post-event video was finalized.",
+                            error,
+                        )
+                    }
+                if (waitingForFinalizedSegment.any { !it.isBuffering }) {
+                    throw IllegalStateException(
+                        "A camera stopped before the SOS post-event video was finalized.",
+                    )
+                }
+                delay(100L)
             }
 
-            return coroutineScope {
-                active.map { resource ->
-                    async(Dispatchers.IO) {
-                        val segments =
-                            resource.segmentMutex.withLock {
-                                resource.segmentFiles
-                                    .filter { segment ->
-                                        segment.endTimeMs > eventWindowStarts.getValue(resource) &&
-                                            segment.startTimeMs < eventEndMs
-                                    }
-                                    .sortedBy(SegmentFile::startTimeMs)
-                            }
+            val segmentFilesByCamera = active.associateWith { resource ->
+                resource.segmentMutex.withLock {
+                    resource.segmentFiles
+                        .filter { segment ->
+                            segment.endTimeMs > eventWindowStarts.getValue(resource) &&
+                                segment.startTimeMs < eventEndMs
+                        }
+                        .sortedBy(SegmentFile::startTimeMs)
+                }
+            }
+            sosProgress = 55
+            val completedVideoCount = AtomicInteger(0)
+            val recordings = coroutineScope {
+                        active.map { resource ->
+                            async(Dispatchers.IO) {
+                        val segments = segmentFilesByCamera.getValue(resource)
                         if (segments.isEmpty()) {
                             throw IllegalStateException(
                                 "No video segments are available for ${resource.id}.",
@@ -322,6 +369,9 @@ internal class AndroidCameraHost(
                                 eventEndMs,
                                 output,
                             )
+                            sosProgress = (
+                                55 + completedVideoCount.incrementAndGet() * 20 / active.size
+                                ).coerceAtMost(75)
                         } catch (error: Throwable) {
                             output.delete()
                             throw error
@@ -329,6 +379,55 @@ internal class AndroidCameraHost(
                         CameraRecordingInfo(resource.id, output.absolutePath)
                     }
                 }.awaitAll()
+            }
+            val frontCamera = active.firstOrNull { cameraFacing(it.id) == CameraCharacteristics.LENS_FACING_FRONT }
+            val backCamera = active.firstOrNull { cameraFacing(it.id) == CameraCharacteristics.LENS_FACING_BACK }
+            if (captureSettings.combinedVideoEnabled && frontCamera != null && backCamera != null) {
+                val completedRecordings = recordings.associateBy(CameraRecordingInfo::cameraId)
+                val frontVideo = completedRecordings[frontCamera.id]
+                    ?: throw IllegalStateException("Completed front-camera SOS video is missing.")
+                val backVideo = completedRecordings[backCamera.id]
+                    ?: throw IllegalStateException("Completed back-camera SOS video is missing.")
+                val combinedOutput = createCombinedSosOutputFile()
+                sosProgress = 75
+                try {
+                    withContext(Dispatchers.IO) {
+                        composeFrontAndBackVideo(
+                            File(frontVideo.filePath),
+                            File(backVideo.filePath),
+                            recordingRotationDegrees(frontCamera.id),
+                            recordingRotationDegrees(backCamera.id),
+                            captureSettings.frameRate.toInt(),
+                            captureSettings.videoBitRate.toInt(),
+                            combinedOutput,
+                            onProgress = { frameProgress ->
+                                sosProgress = 75 + (frameProgress * 24).toInt().coerceIn(0, 24)
+                            },
+                        )
+                    }
+                } catch (error: Throwable) {
+                    if (combinedOutput.exists() && !combinedOutput.delete()) {
+                        error.addSuppressed(
+                            IllegalStateException(
+                                "Could not remove incomplete combined SOS output ${combinedOutput.absolutePath}.",
+                            ),
+                        )
+                    }
+                    Log.e(TAG, "Could not compose the combined front/back SOS video.", error)
+                    sosSaved = true
+                    sosProgress = 100
+                    return recordings + CameraRecordingInfo(
+                        COMBINED_ERROR_CAMERA_ID,
+                        error.message ?: "Unknown combined-video encoding error.",
+                    )
+                }
+                sosSaved = true
+                sosProgress = 100
+                recordings + CameraRecordingInfo(COMBINED_CAMERA_ID, combinedOutput.absolutePath)
+            } else {
+                sosSaved = true
+                sosProgress = 100
+                recordings
             }
         } finally {
             withContext(NonCancellable) {
@@ -341,6 +440,7 @@ internal class AndroidCameraHost(
                     }
                 }
                 sosInProgress = false
+                if (!sosSaved) sosProgress = 0
             }
         }
     }
@@ -460,7 +560,11 @@ internal class AndroidCameraHost(
             "Camera $id is no longer available. Refresh the camera list.",
         )
 
-    /** Checks Android's advertised camera combinations before opening multiple devices. */
+    /**
+     * Checks Android's advertised combinations but lets the actual capture
+     * session decide. Some OEM camera providers support combinations that are
+     * missing from this capability list.
+     */
     private fun checkConcurrentCameraSupport(cameraIds: List<String>) {
         if (cameraIds.size < 2 || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             return
@@ -475,9 +579,10 @@ internal class AndroidCameraHost(
                 )
             }
         if (cameraSets.none { it.containsAll(cameraIds) }) {
-            throw IllegalStateException(
-                "This device does not advertise simultaneous capture for all selected " +
-                    "cameras. Try a supported pair of cameras.",
+            Log.w(
+                TAG,
+                "Android does not advertise concurrent capture for $cameraIds " +
+                    "(advertised combinations: $cameraSets); trying actual camera sessions.",
             )
         }
     }
@@ -736,6 +841,368 @@ internal class AndroidCameraHost(
         }
     }
 
+    /**
+     * Decodes the front/rear rolling segments and encodes them side-by-side
+     * into one SOS video. This is post-processing; it does not bypass Camera2
+     * concurrent-camera restrictions.
+     */
+    private fun composeFrontAndBackVideo(
+        frontVideo: File,
+        backVideo: File,
+        frontRotationDegrees: Int,
+        backRotationDegrees: Int,
+        frameRate: Int,
+        bitRate: Int,
+        outputFile: File,
+        onProgress: (Float) -> Unit,
+    ) {
+        val frontSource = MediaMetadataRetriever().apply {
+            setDataSource(frontVideo.absolutePath)
+        }
+        val backSource = MediaMetadataRetriever().apply {
+            setDataSource(backVideo.absolutePath)
+        }
+        val frontDurationMs = frontSource.extractMetadata(
+            MediaMetadataRetriever.METADATA_KEY_DURATION,
+        )?.toLongOrNull() ?: 0L
+        val backDurationMs = backSource.extractMetadata(
+            MediaMetadataRetriever.METADATA_KEY_DURATION,
+        )?.toLongOrNull() ?: 0L
+        val durationMs = minOf(frontDurationMs, backDurationMs)
+        val frontMetadataRotation = frontSource.extractMetadata(
+            MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION,
+        )?.toIntOrNull()?.let { ((it % 360) + 360) % 360 } ?: 0
+        val backMetadataRotation = backSource.extractMetadata(
+            MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION,
+        )?.toIntOrNull()?.let { ((it % 360) + 360) % 360 } ?: 0
+        val frontRotation = frontMetadataRotation.takeIf { it != 0 } ?: frontRotationDegrees
+        val backRotation = backMetadataRotation.takeIf { it != 0 } ?: backRotationDegrees
+        if (durationMs <= 0L) {
+            frontSource.release()
+            backSource.release()
+            throw IllegalStateException(
+                "The completed front/back SOS videos do not contain readable video duration metadata.",
+            )
+        }
+        val encoderInfo = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+            .codecInfos
+            .firstOrNull { info ->
+                info.isEncoder &&
+                    info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) } &&
+                    info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                        .colorFormats
+                        .contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+            } ?: run {
+                frontSource.release()
+                backSource.release()
+                throw IllegalStateException("This device has no compatible AVC encoder for combined video.")
+            }
+        val encoder = MediaCodec.createByCodecName(encoderInfo.name)
+        var muxer: MediaMuxer? = null
+        var muxerStarted = false
+        var muxerStopped = false
+        var outputTrack = -1
+        var muxerSamples = 0
+        var outputEos = false
+        var encoderStarted = false
+        val width = COMBINED_VIDEO_WIDTH
+        val height = COMBINED_VIDEO_HEIGHT
+        val frameIntervalUs = 1_000_000L / frameRate
+        val frameCount = ((durationMs * frameRate) / 1000L)
+            .coerceAtLeast(1L)
+        val frameBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(frameBitmap)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        var frontFrame: Bitmap? = null
+        var backFrame: Bitmap? = null
+
+        fun drainEncoder(endOfStream: Boolean) {
+            val bufferInfo = MediaCodec.BufferInfo()
+            while (true) {
+                val outputIndex = encoder.dequeueOutputBuffer(
+                    bufferInfo,
+                    if (endOfStream) CODEC_TIMEOUT_US else 0L,
+                )
+                when {
+                    outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        if (!endOfStream) return
+                    }
+                    outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        if (muxerStarted) {
+                            throw IllegalStateException("Combined video encoder changed format unexpectedly.")
+                        }
+                        muxer = MediaMuxer(
+                            outputFile.absolutePath,
+                            MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4,
+                        )
+                        outputTrack = muxer!!.addTrack(encoder.outputFormat)
+                        muxer!!.start()
+                        muxerStarted = true
+                    }
+                    outputIndex >= 0 -> {
+                        val encodedData = encoder.getOutputBuffer(outputIndex)
+                            ?: throw IllegalStateException("The combined video encoder returned an empty buffer.")
+                        val isCodecConfig =
+                            bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
+                        if (bufferInfo.size > 0 && !isCodecConfig) {
+                            if (!muxerStarted) {
+                                throw IllegalStateException("The combined video encoder produced data before its format.")
+                            }
+                            encodedData.position(bufferInfo.offset)
+                            encodedData.limit(bufferInfo.offset + bufferInfo.size)
+                            muxer!!.writeSampleData(outputTrack, encodedData, bufferInfo)
+                            muxerSamples++
+                        }
+                        outputEos = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                        encoder.releaseOutputBuffer(outputIndex, false)
+                        if (outputEos) return
+                    }
+                }
+            }
+        }
+
+        fun frameFor(
+            source: MediaMetadataRetriever,
+            timestampUs: Long,
+            rotationDegrees: Int,
+        ): Bitmap {
+            val safeTimestampUs =
+                timestampUs.coerceAtMost((durationMs - 1L).coerceAtLeast(0L) * 1000L)
+            val decoded = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                source.getScaledFrameAtTime(
+                    safeTimestampUs,
+                    MediaMetadataRetriever.OPTION_CLOSEST,
+                    width / 2,
+                    height,
+                )
+            } else {
+                source.getFrameAtTime(safeTimestampUs, MediaMetadataRetriever.OPTION_CLOSEST)
+            } ?: throw IllegalStateException("Could not decode a completed SOS video frame.")
+            if (rotationDegrees == 0) return decoded
+            val transform = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+            val rotated = Bitmap.createBitmap(
+                decoded,
+                0,
+                0,
+                decoded.width,
+                decoded.height,
+                transform,
+                true,
+            )
+            if (rotated !== decoded) decoded.recycle()
+            return rotated
+        }
+
+        try {
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            }
+            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            encoder.start()
+            encoderStarted = true
+
+            for (frameNumber in 0 until frameCount) {
+                val timestampUs = frameNumber * frameIntervalUs
+                frontFrame?.recycle()
+                backFrame?.recycle()
+                frontFrame = frameFor(frontSource, timestampUs, frontRotation)
+                backFrame = frameFor(backSource, timestampUs, backRotation)
+                canvas.drawColor(android.graphics.Color.BLACK)
+                drawFittedFrame(
+                    canvas,
+                    frontFrame!!,
+                    Rect(0, 0, width / 2, height),
+                    paint,
+                )
+                drawFittedFrame(
+                    canvas,
+                    backFrame!!,
+                    Rect(width / 2, 0, width, height),
+                    paint,
+                )
+
+                var inputIndex = encoder.dequeueInputBuffer(CODEC_TIMEOUT_US)
+                while (inputIndex < 0) {
+                    drainEncoder(endOfStream = false)
+                    inputIndex = encoder.dequeueInputBuffer(CODEC_TIMEOUT_US)
+                }
+                val inputImage = encoder.getInputImage(inputIndex)
+                    ?: throw IllegalStateException("The combined video encoder has no writable frame buffer.")
+                try {
+                    writeBitmapToYuv420(frameBitmap, inputImage)
+                } finally {
+                    inputImage.close()
+                }
+                encoder.queueInputBuffer(
+                    inputIndex,
+                    0,
+                    width * height * 3 / 2,
+                    frameNumber * frameIntervalUs,
+                    0,
+                )
+                drainEncoder(endOfStream = false)
+                if (frameNumber % maxOf(frameCount / 100L, 1L) == 0L) {
+                    onProgress((frameNumber + 1).toFloat() / frameCount)
+                }
+            }
+
+            var inputIndex = encoder.dequeueInputBuffer(CODEC_TIMEOUT_US)
+            while (inputIndex < 0) {
+                drainEncoder(endOfStream = false)
+                inputIndex = encoder.dequeueInputBuffer(CODEC_TIMEOUT_US)
+            }
+            encoder.queueInputBuffer(
+                inputIndex,
+                0,
+                0,
+                frameCount * frameIntervalUs,
+                MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+            )
+            while (!outputEos) drainEncoder(endOfStream = true)
+            if (!muxerStarted || muxerSamples == 0) {
+                throw IllegalStateException("The combined video encoder produced no output.")
+            }
+            muxerStopped = true
+            muxer!!.stop()
+            validateCombinedVideo(outputFile)
+        } finally {
+            frontFrame?.recycle()
+            backFrame?.recycle()
+            frameBitmap.recycle()
+            frontSource.release()
+            backSource.release()
+            try {
+                if (encoderStarted) encoder.stop()
+            } finally {
+                encoder.release()
+                if (muxerStarted && muxerSamples > 0 && outputEos && !muxerStopped) {
+                    muxer?.stop()
+                }
+                muxer?.release()
+            }
+        }
+    }
+
+    /** Rejects a finalized combined file unless Android can read video samples from it. */
+    private fun validateCombinedVideo(file: File) {
+        val extractor = MediaExtractor()
+        var durationUs = 0L
+        try {
+            extractor.setDataSource(file.absolutePath)
+            val videoTrack = (0 until extractor.trackCount).firstOrNull { index ->
+                extractor.getTrackFormat(index)
+                    .getString(MediaFormat.KEY_MIME)
+                    ?.startsWith("video/") == true
+            } ?: throw IllegalStateException("The combined SOS file has no video track.")
+            durationUs = extractor.getTrackFormat(videoTrack)
+                .getLong(MediaFormat.KEY_DURATION)
+            extractor.selectTrack(videoTrack)
+            if (!extractor.advance()) {
+                throw IllegalStateException("The combined SOS file contains no video samples.")
+            }
+        } finally {
+            extractor.release()
+        }
+        if (durationUs <= 0L) {
+            throw IllegalStateException("The combined SOS file has no playable duration.")
+        }
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(file.absolutePath)
+            val firstFrame = retriever.getFrameAtTime(
+                0L,
+                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+            ) ?: throw IllegalStateException("The combined SOS video cannot decode its first frame.")
+            firstFrame.recycle()
+        } finally {
+            retriever.release()
+        }
+    }
+
+    /** Fits each source frame inside its panel without cropping or distortion. */
+    private fun drawFittedFrame(
+        canvas: Canvas,
+        frame: Bitmap,
+        destination: Rect,
+        paint: Paint,
+    ) {
+        val scale = minOf(
+            destination.width().toFloat() / frame.width,
+            destination.height().toFloat() / frame.height,
+        )
+        val width = (frame.width * scale).toInt()
+        val height = (frame.height * scale).toInt()
+        val left = destination.left + (destination.width() - width) / 2
+        val top = destination.top + (destination.height() - height) / 2
+        canvas.drawBitmap(frame, null, Rect(left, top, left + width, top + height), paint)
+    }
+
+    /** Copies an ARGB bitmap into the flexible YUV420 planes expected by MediaCodec. */
+    private fun writeBitmapToYuv420(bitmap: Bitmap, image: android.media.Image) {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+        val yBufferStart = yBuffer.position()
+        val uBufferStart = uBuffer.position()
+        val vBufferStart = vBuffer.position()
+        for (row in 0 until bitmap.height) {
+            for (column in 0 until bitmap.width) {
+                val color = pixels[row * bitmap.width + column]
+                val red = color shr 16 and 0xff
+                val green = color shr 8 and 0xff
+                val blue = color and 0xff
+                val y = ((66 * red + 129 * green + 25 * blue + 128) shr 8) + 16
+                yBuffer.put(
+                    yBufferStart + row * yPlane.rowStride + column * yPlane.pixelStride,
+                    y.coerceIn(0, 255).toByte(),
+                )
+                if (row % 2 == 0 && column % 2 == 0) {
+                    val chromaRow = row / 2
+                    val chromaColumn = column / 2
+                    val u = ((-38 * red - 74 * green + 112 * blue + 128) shr 8) + 128
+                    val v = ((112 * red - 94 * green - 18 * blue + 128) shr 8) + 128
+                    uBuffer.put(
+                        uBufferStart + chromaRow * uPlane.rowStride +
+                            chromaColumn * uPlane.pixelStride,
+                        u.coerceIn(0, 255).toByte(),
+                    )
+                    vBuffer.put(
+                        vBufferStart + chromaRow * vPlane.rowStride +
+                            chromaColumn * vPlane.pixelStride,
+                        v.coerceIn(0, 255).toByte(),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun cameraFacing(cameraId: String): Int? =
+        cameraManager.getCameraCharacteristics(cameraId).get(CameraCharacteristics.LENS_FACING)
+
+    /**
+     * Calculates the rotation needed to make a recorder frame upright on the
+     * current display, accounting for front/rear sensor orientation.
+     */
+    private fun recordingRotationDegrees(cameraId: String): Int {
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        val sensorOrientation =
+            characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val displayDegrees = (activity.windowManager.defaultDisplay.rotation * 90) % 360
+        return when (characteristics.get(CameraCharacteristics.LENS_FACING)) {
+            CameraCharacteristics.LENS_FACING_FRONT ->
+                (sensorOrientation + displayDegrees) % 360
+            else -> (sensorOrientation - displayDegrees + 360) % 360
+        }
+    }
+
     /** Verifies every encoded segment can share one MP4 track. */
     private fun formatsAreCompatible(first: MediaFormat, next: MediaFormat): Boolean =
         first.getString(MediaFormat.KEY_MIME) == next.getString(MediaFormat.KEY_MIME) &&
@@ -766,6 +1233,18 @@ internal class AndroidCameraHost(
         return File(recordingsDirectory, "sos_${safeId}_$timestamp.mp4")
     }
 
+    private fun createCombinedSosOutputFile(): File {
+        val directory =
+            activity.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+                ?: activity.filesDir
+        val recordingsDirectory = File(directory, "CameraRecordings")
+        if (!recordingsDirectory.exists() && !recordingsDirectory.mkdirs()) {
+            throw IllegalStateException("Could not create the SOS video folder.")
+        }
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        return File(recordingsDirectory, "sos_front_back_$timestamp.mp4")
+    }
+
     /** Removes temporary segments left behind if Android previously killed the app. */
     private fun removeStaleTemporarySegments() {
         if (bufferCameraIds.isNotEmpty()) return
@@ -780,19 +1259,37 @@ internal class AndroidCameraHost(
         cameraId: String,
         characteristics: CameraCharacteristics,
     ): Size {
-        val supportedSizes =
-            characteristics
-                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                ?.getOutputSizes(MediaRecorder::class.java)
-                ?.toList()
-                .orEmpty()
-        return supportedSizes
+        val streamMap = characteristics.get(
+            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP,
+        )
+        val recorderSizes = streamMap
+            ?.getOutputSizes(MediaRecorder::class.java)
+            ?.toList()
+            .orEmpty()
+        val selectedRecorderSize = recorderSizes
             .filter { it.width * it.height <= VIDEO_WIDTH * VIDEO_HEIGHT }
             .maxByOrNull { it.width * it.height }
-            ?: supportedSizes.minByOrNull { it.width * it.height }
-            ?: throw IllegalStateException(
-                "Camera $cameraId does not report a supported video recording size.",
+            ?: recorderSizes.minByOrNull { it.width * it.height }
+        if (selectedRecorderSize != null) return selectedRecorderSize
+
+        val previewSize = streamMap
+            ?.getOutputSizes(SurfaceTexture::class.java)
+            ?.filter { it.width * it.height <= VIDEO_WIDTH * VIDEO_HEIGHT }
+            ?.maxByOrNull { it.width * it.height }
+        if (previewSize != null) {
+            Log.w(
+                TAG,
+                "Camera $cameraId has no advertised MediaRecorder size; " +
+                    "using $previewSize to keep its preview visible. Recording may be unsupported.",
             )
+            return previewSize
+        }
+
+        Log.w(
+            TAG,
+            "Camera $cameraId reports no Camera2 output sizes; listing it with a VGA fallback.",
+        )
+        return Size(FALLBACK_VIDEO_WIDTH, FALLBACK_VIDEO_HEIGHT)
     }
 
     /** Bridges Camera2 callback-based session setup into a suspending call. */
@@ -942,6 +1439,13 @@ internal class AndroidCameraHost(
         const val CAMERA_PERMISSION_REQUEST = 8912
         private const val VIDEO_WIDTH = 1280
         private const val VIDEO_HEIGHT = 720
+        private const val FALLBACK_VIDEO_WIDTH = 640
+        private const val FALLBACK_VIDEO_HEIGHT = 480
+        private const val COMBINED_VIDEO_WIDTH = 640
+        private const val COMBINED_VIDEO_HEIGHT = 360
+        private const val COMBINED_CAMERA_ID = "combined"
+        private const val COMBINED_ERROR_CAMERA_ID = "combined_error"
+        private const val CODEC_TIMEOUT_US = 10_000L
         private const val MINIMUM_SEGMENT_DURATION_MS = 1_000L
         private const val MAX_SAMPLE_BUFFER_BYTES = 8 * 1024 * 1024
         private const val TAG = "AndroidCameraHost"

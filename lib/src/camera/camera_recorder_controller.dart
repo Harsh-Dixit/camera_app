@@ -24,23 +24,35 @@ class CameraRecorderController extends ChangeNotifier {
   final List<CameraDeviceInfo> _cameras = <CameraDeviceInfo>[];
   final Set<String> _selectedCameraIds = <String>{};
   final Map<String, String> _recordingPaths = <String, String>{};
+  final List<List<CameraRecordingInfo>> _recordingHistory =
+      <List<CameraRecordingInfo>>[];
 
   bool _isLoading = true;
   bool _isBusy = false;
   bool _isBuffering = false;
   bool _isCapturingSos = false;
   bool _isClosed = false;
+  bool _isDisposed = false;
   int _bufferingSeconds = 0;
+  int _sosProgress = 0;
+  bool _isRefreshingSosProgress = false;
   DateTime? _sosCaptureStartedAt;
   String? _message;
 
   List<CameraDeviceInfo> get cameras => List.unmodifiable(_cameras);
   Set<String> get selectedCameraIds => Set.unmodifiable(_selectedCameraIds);
   Map<String, String> get recordingPaths => Map.unmodifiable(_recordingPaths);
+  List<List<CameraRecordingInfo>> get recordingHistory =>
+      List.unmodifiable(
+        _recordingHistory.map(
+          (batch) => List<CameraRecordingInfo>.unmodifiable(batch),
+        ),
+      );
   bool get isLoading => _isLoading;
   bool get isBusy => _isBusy;
   bool get isBuffering => _isBuffering;
   bool get isCapturingSos => _isCapturingSos;
+  int get sosProgress => _sosProgress;
   // SOS is available as soon as native segment capture is running. The
   // available pre-roll affects clip length, not whether the emergency action works.
   bool get isSosReady => _isBuffering && !_isCapturingSos;
@@ -132,6 +144,7 @@ class CameraRecorderController extends ChangeNotifier {
     await _applyPreviewSelection(previous);
   }
 
+  /// Applies the new selection to Android and restores the old selection on failure.
   Future<void> _applyPreviewSelection(Set<String> previous) async {
     _isBusy = true;
     _message = null;
@@ -158,6 +171,7 @@ class CameraRecorderController extends ChangeNotifier {
     _isBusy = true;
     _message = null;
     _bufferingSeconds = 0;
+    _recordingPaths.clear();
     _notifyListeners();
 
     try {
@@ -177,6 +191,7 @@ class CameraRecorderController extends ChangeNotifier {
   }
 
   /// Updates the amount of pre-event footage available for the next SOS clip.
+  /// Reads native buffer duration and updates the available SOS pre-roll message.
   Future<void> refreshBufferingStatus() async {
     if (!_isBuffering || _isBusy || _isClosed) return;
     final previousSeconds = _bufferingSeconds;
@@ -212,6 +227,7 @@ class CameraRecorderController extends ChangeNotifier {
     if (_isBusy || !isSosReady || _isClosed) return;
     _isBusy = true;
     _isCapturingSos = true;
+    _sosProgress = 0;
     _sosCaptureStartedAt = DateTime.now();
     _message = null;
     _notifyListeners();
@@ -220,31 +236,67 @@ class CameraRecorderController extends ChangeNotifier {
     try {
       final recordings = await _service.triggerSos();
       if (_isClosed) return;
+      _sosProgress = 100;
       final returnedCameraIds = recordings.map((item) => item.cameraId).toSet();
-      if (recordings.length != _selectedCameraIds.length ||
-          returnedCameraIds.length != recordings.length ||
-          !returnedCameraIds.containsAll(_selectedCameraIds) ||
+      final selectedCameras = _cameras
+          .where((camera) => _selectedCameraIds.contains(camera.id))
+          .toList();
+      final hasFrontAndBack = selectedCameras.any(
+            (camera) => camera.facing.toLowerCase().contains('front'),
+          ) &&
+          selectedCameras.any(
+            (camera) => camera.facing.toLowerCase().contains('back'),
+          );
+      final shouldSaveCombinedVideo =
+          settings.combinedVideoEnabled && hasFrontAndBack;
+      final combinedError = recordings.where(
+        (recording) => recording.cameraId == 'combined_error',
+      );
+      final combinedVideoFailed = combinedError.isNotEmpty;
+      final expectedCameraIds = <String>{
+        ..._selectedCameraIds,
+        if (shouldSaveCombinedVideo && !combinedVideoFailed) 'combined',
+      };
+      final allowedCameraIds = <String>{
+        ...expectedCameraIds,
+        if (shouldSaveCombinedVideo) 'combined_error',
+      };
+      if (returnedCameraIds.length != recordings.length ||
+          !returnedCameraIds.containsAll(expectedCameraIds) ||
+          returnedCameraIds.any((id) => !allowedCameraIds.contains(id)) ||
           recordings.any((item) => item.filePath.isEmpty)) {
         throw StateError(
           'The native camera service did not save one SOS video for every '
-          'selected camera.',
+          'selected camera and the combined front/back video when applicable.',
         );
       }
-      _recordingPaths
-        ..clear()
-        ..addEntries(
-          recordings.map(
-            (recording) => MapEntry(recording.cameraId, recording.filePath),
-          ),
-        );
-      _message =
-          'Saved ${recordings.length} separate SOS video'
-          '${recordings.length == 1 ? '' : 's'}.';
+      _recordingPaths.addEntries(
+        recordings.where((recording) => recording.cameraId != 'combined_error').map(
+          (recording) => MapEntry(recording.cameraId, recording.filePath),
+        ),
+      );
+      final savedRecordings = recordings
+          .where((recording) => recording.cameraId != 'combined_error')
+          .toList(growable: false);
+      _recordingHistory.add(List.unmodifiable(savedRecordings));
+      final combinedPath = _recordingPaths['combined'];
+      _message = combinedVideoFailed
+          ? 'SOS #${_recordingHistory.length} saved individual camera videos, '
+                'but combined front/back video failed: ${combinedError.first.filePath}'
+          : combinedPath != null &&
+              recordings.any((recording) => recording.cameraId == 'combined')
+          ? 'SOS #${_recordingHistory.length} saved: '
+                '${_selectedCameraIds.length} separate videos and combined '
+                'front/back video: $combinedPath'
+          : 'SOS #${_recordingHistory.length} saved: '
+                '${_selectedCameraIds.length} separate video'
+                '${_selectedCameraIds.length == 1 ? '' : 's'}.';
     } catch (error) {
       captureError = _errorMessage(error, 'Could not save the SOS videos.');
     } finally {
       _isCapturingSos = false;
       _sosCaptureStartedAt = null;
+      if (captureError != null) _sosProgress = 0;
       _isBusy = false;
       _notifyListeners();
     }
@@ -257,7 +309,31 @@ class CameraRecorderController extends ChangeNotifier {
     }
   }
 
+  /// Polls progress reported by native capture/assembly work.
+  /// Reads native save progress so Provider listeners can update the progress bar.
+  Future<void> refreshSosProgress() async {
+    if (!_isCapturingSos || _isClosed || _isRefreshingSosProgress) return;
+    _isRefreshingSosProgress = true;
+    try {
+      final progress = await _service.getSosProgress();
+      if (_isClosed || !_isCapturingSos) return;
+      final boundedProgress = progress.clamp(0, 99);
+      if (boundedProgress > _sosProgress) {
+        _sosProgress = boundedProgress;
+        _notifyListeners();
+      }
+    } catch (error) {
+      if (!_isClosed && _isCapturingSos) {
+        _message = _errorMessage(error, 'Could not read SOS save progress.');
+        _notifyListeners();
+      }
+    } finally {
+      _isRefreshingSosProgress = false;
+    }
+  }
+
   /// Stops rolling capture and discards all untriggered temporary segments.
+  /// Stops rolling capture and removes temporary segments that were not saved.
   Future<void> stopBuffering() async {
     if (_isBusy || !_isBuffering || _isClosed) return;
     _isBusy = true;
@@ -277,9 +353,28 @@ class CameraRecorderController extends ChangeNotifier {
   }
 
   /// Stops native camera activity when the screen is disposed.
+  /// Releases native cameras when Provider removes this controller from the tree.
   Future<void> close() async {
     if (_isClosed) return;
     _isClosed = true;
+    await _releaseNativeCameras();
+    dispose();
+  }
+
+  /// Releases native cameras when the Provider disposes this state object.
+  @override
+  void dispose() {
+    if (_isDisposed) return;
+    _isDisposed = true;
+    if (!_isClosed) {
+      _isClosed = true;
+      unawaited(_releaseNativeCameras());
+    }
+    super.dispose();
+  }
+
+  /// Performs native camera cleanup and reports failures to Flutter's error handler.
+  Future<void> _releaseNativeCameras() async {
     if (_isAndroidPlatform) {
       try {
         await _service.releaseCameras();
@@ -296,9 +391,9 @@ class CameraRecorderController extends ChangeNotifier {
         );
       }
     }
-    super.dispose();
   }
 
+  /// Chooses a user-readable error from a platform failure or fallback message.
   String _errorMessage(Object error, String fallback) {
     if (error is PlatformException && error.message != null) {
       return error.message!;
@@ -307,6 +402,7 @@ class CameraRecorderController extends ChangeNotifier {
     return text.isEmpty ? fallback : '$fallback $text';
   }
 
+  /// Notifies the UI only while this controller is still active.
   void _notifyListeners() {
     if (!_isClosed) notifyListeners();
   }

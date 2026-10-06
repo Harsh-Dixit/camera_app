@@ -261,6 +261,7 @@ class SosCaptureSettings {
     required this.postEventDurationSeconds,
     required this.frameRate,
     required this.videoBitRate,
+    required this.combinedVideoEnabled,
   });
 
   int segmentDurationSeconds;
@@ -273,6 +274,8 @@ class SosCaptureSettings {
 
   int videoBitRate;
 
+  bool combinedVideoEnabled;
+
   List<Object?> _toList() {
     return <Object?>[
       segmentDurationSeconds,
@@ -280,6 +283,7 @@ class SosCaptureSettings {
       postEventDurationSeconds,
       frameRate,
       videoBitRate,
+      combinedVideoEnabled,
     ];
   }
 
@@ -294,6 +298,7 @@ class SosCaptureSettings {
       postEventDurationSeconds: result[2]! as int,
       frameRate: result[3]! as int,
       videoBitRate: result[4]! as int,
+      combinedVideoEnabled: result[5]! as bool,
     );
   }
 
@@ -306,7 +311,7 @@ class SosCaptureSettings {
     if (identical(this, other)) {
       return true;
     }
-    return _deepEquals(segmentDurationSeconds, other.segmentDurationSeconds) && _deepEquals(preEventDurationSeconds, other.preEventDurationSeconds) && _deepEquals(postEventDurationSeconds, other.postEventDurationSeconds) && _deepEquals(frameRate, other.frameRate) && _deepEquals(videoBitRate, other.videoBitRate);
+    return _deepEquals(segmentDurationSeconds, other.segmentDurationSeconds) && _deepEquals(preEventDurationSeconds, other.preEventDurationSeconds) && _deepEquals(postEventDurationSeconds, other.postEventDurationSeconds) && _deepEquals(frameRate, other.frameRate) && _deepEquals(videoBitRate, other.videoBitRate) && _deepEquals(combinedVideoEnabled, other.combinedVideoEnabled);
   }
 
   @override
@@ -315,7 +320,7 @@ class SosCaptureSettings {
 
   @override
   String toString() {
-    return 'SosCaptureSettings(segmentDurationSeconds: $segmentDurationSeconds, preEventDurationSeconds: $preEventDurationSeconds, postEventDurationSeconds: $postEventDurationSeconds, frameRate: $frameRate, videoBitRate: $videoBitRate)';
+    return 'SosCaptureSettings(segmentDurationSeconds: $segmentDurationSeconds, preEventDurationSeconds: $preEventDurationSeconds, postEventDurationSeconds: $postEventDurationSeconds, frameRate: $frameRate, videoBitRate: $videoBitRate, combinedVideoEnabled: $combinedVideoEnabled)';
   }
 }
 
@@ -460,6 +465,26 @@ class CameraHostApi {
   /// Returns the number of pre-event seconds retained for every active camera.
   Future<int> getBufferingSeconds() async {
     final pigeonVar_channelName = 'dev.flutter.pigeon.camera_app.CameraHostApi.getBufferingSeconds$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(null);
+    final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
+
+    final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
+        pigeonVar_replyList,
+        pigeonVar_channelName,
+        isNullValid: false,
+    )
+    ;
+    return pigeonVar_replyValue! as int;
+  }
+
+  /// Returns the current SOS save progress from 0 to 100.
+  Future<int> getSosProgress() async {
+    final pigeonVar_channelName = 'dev.flutter.pigeon.camera_app.CameraHostApi.getSosProgress$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,

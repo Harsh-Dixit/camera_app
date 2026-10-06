@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:camera_app/src/camera/camera_service.dart';
 import 'package:camera_app/src/camera/capture_settings.dart';
 import 'package:camera_app/src/platform/camera_api.g.dart';
@@ -15,7 +17,9 @@ class FakeCameraService implements CameraService {
   List<CameraDeviceInfo> cameras = testCameras;
   Object? sosError;
   List<CameraRecordingInfo>? sosResult;
+  Completer<List<CameraRecordingInfo>>? sosCompleter;
   int bufferingSeconds = 30;
+  int sosProgress = 0;
   CaptureSettings? receivedSettings;
 
   int permissionRequests = 0;
@@ -62,11 +66,24 @@ class FakeCameraService implements CameraService {
   }
 
   @override
+  Future<int> getSosProgress() async => sosProgress;
+
+  @override
   Future<List<CameraRecordingInfo>> triggerSos() async {
     sosRequests++;
     if (sosError case final error?) throw error;
-    return sosResult ??
-        bufferingSelections.last.map(recordingFor).toList();
+    if (sosCompleter case final completer?) return completer.future;
+    if (sosResult case final result?) return result;
+    final cameraIds = bufferingSelections.last;
+    final combinedVideoEnabled =
+        receivedSettings?.combinedVideoEnabled ?? false;
+    return <CameraRecordingInfo>[
+      ...cameraIds.map(recordingFor),
+      if (combinedVideoEnabled &&
+          cameraIds.contains('front') &&
+          cameraIds.contains('back'))
+        recordingFor('combined'),
+    ];
   }
 
   @override

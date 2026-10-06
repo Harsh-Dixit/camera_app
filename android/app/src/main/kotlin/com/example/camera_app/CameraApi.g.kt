@@ -346,7 +346,8 @@ data class SosCaptureSettings (
   val preEventDurationSeconds: Long,
   val postEventDurationSeconds: Long,
   val frameRate: Long,
-  val videoBitRate: Long
+  val videoBitRate: Long,
+  val combinedVideoEnabled: Boolean
 )
  {
   companion object {
@@ -356,7 +357,8 @@ data class SosCaptureSettings (
       val postEventDurationSeconds = pigeonVar_list[2] as Long
       val frameRate = pigeonVar_list[3] as Long
       val videoBitRate = pigeonVar_list[4] as Long
-      return SosCaptureSettings(segmentDurationSeconds, preEventDurationSeconds, postEventDurationSeconds, frameRate, videoBitRate)
+      val combinedVideoEnabled = pigeonVar_list[5] as Boolean
+      return SosCaptureSettings(segmentDurationSeconds, preEventDurationSeconds, postEventDurationSeconds, frameRate, videoBitRate, combinedVideoEnabled)
     }
   }
   fun toList(): List<Any?> {
@@ -366,6 +368,7 @@ data class SosCaptureSettings (
       postEventDurationSeconds,
       frameRate,
       videoBitRate,
+      combinedVideoEnabled,
     )
   }
   override fun equals(other: Any?): Boolean {
@@ -376,7 +379,7 @@ data class SosCaptureSettings (
       return true
     }
     val other = other as SosCaptureSettings
-    return CameraApiPigeonUtils.deepEquals(this.segmentDurationSeconds, other.segmentDurationSeconds) && CameraApiPigeonUtils.deepEquals(this.preEventDurationSeconds, other.preEventDurationSeconds) && CameraApiPigeonUtils.deepEquals(this.postEventDurationSeconds, other.postEventDurationSeconds) && CameraApiPigeonUtils.deepEquals(this.frameRate, other.frameRate) && CameraApiPigeonUtils.deepEquals(this.videoBitRate, other.videoBitRate)
+    return CameraApiPigeonUtils.deepEquals(this.segmentDurationSeconds, other.segmentDurationSeconds) && CameraApiPigeonUtils.deepEquals(this.preEventDurationSeconds, other.preEventDurationSeconds) && CameraApiPigeonUtils.deepEquals(this.postEventDurationSeconds, other.postEventDurationSeconds) && CameraApiPigeonUtils.deepEquals(this.frameRate, other.frameRate) && CameraApiPigeonUtils.deepEquals(this.videoBitRate, other.videoBitRate) && CameraApiPigeonUtils.deepEquals(this.combinedVideoEnabled, other.combinedVideoEnabled)
   }
 
   override fun hashCode(): Int {
@@ -386,10 +389,11 @@ data class SosCaptureSettings (
     result = 31 * result + CameraApiPigeonUtils.deepHash(this.postEventDurationSeconds)
     result = 31 * result + CameraApiPigeonUtils.deepHash(this.frameRate)
     result = 31 * result + CameraApiPigeonUtils.deepHash(this.videoBitRate)
+    result = 31 * result + CameraApiPigeonUtils.deepHash(this.combinedVideoEnabled)
     return result
   }
   override fun toString(): String {
-    return "SosCaptureSettings(segmentDurationSeconds=$segmentDurationSeconds, preEventDurationSeconds=$preEventDurationSeconds, postEventDurationSeconds=$postEventDurationSeconds, frameRate=$frameRate, videoBitRate=$videoBitRate)"
+    return "SosCaptureSettings(segmentDurationSeconds=$segmentDurationSeconds, preEventDurationSeconds=$preEventDurationSeconds, postEventDurationSeconds=$postEventDurationSeconds, frameRate=$frameRate, videoBitRate=$videoBitRate, combinedVideoEnabled=$combinedVideoEnabled)"
   }
 }
 private open class CameraApiPigeonCodec : StandardMessageCodec() {
@@ -458,6 +462,8 @@ interface CameraHostApi {
   suspend fun startBuffering(cameraIds: List<String>, settings: SosCaptureSettings)
   /** Returns the number of pre-event seconds retained for every active camera. */
   suspend fun getBufferingSeconds(): Long
+  /** Returns the current SOS save progress from 0 to 100. */
+  suspend fun getSosProgress(): Long
   /** Saves pre-event footage and records the configured post-event duration. */
   suspend fun triggerSos(): List<CameraRecordingInfo>
   /** Stops rolling capture and deletes its temporary segments. */
@@ -556,6 +562,23 @@ interface CameraHostApi {
             CoroutineScope(Dispatchers.Main).launch {
               val wrapped: List<Any?> = try {
                 listOf(api.getBufferingSeconds())
+              } catch (exception: Throwable) {
+                CameraApiPigeonUtils.wrapError(exception)
+              }
+              reply.reply(wrapped)
+            }
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+      run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.camera_app.CameraHostApi.getSosProgress$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { _, reply ->
+            CoroutineScope(Dispatchers.Main).launch {
+              val wrapped: List<Any?> = try {
+                listOf(api.getSosProgress())
               } catch (exception: Throwable) {
                 CameraApiPigeonUtils.wrapError(exception)
               }

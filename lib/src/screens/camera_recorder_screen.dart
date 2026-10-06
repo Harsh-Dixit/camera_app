@@ -1,48 +1,32 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 
 import '../camera/camera_recorder_controller.dart';
-import '../camera/camera_service.dart';
-import '../camera/capture_settings.dart';
 import '../widgets/camera_card.dart';
 import '../widgets/empty_camera_state.dart';
 
 /// Presents camera previews and recording controls for Android devices.
 class CameraRecorderScreen extends StatefulWidget {
-  const CameraRecorderScreen({
-    required this.cameraService,
-    this.isAndroidPlatform,
-    this.captureSettings = const CaptureSettings(),
-    super.key,
-  });
-
-  final CameraService cameraService;
-  final bool? isAndroidPlatform;
-  final CaptureSettings captureSettings;
+  const CameraRecorderScreen({super.key});
 
   @override
   State<CameraRecorderScreen> createState() => _CameraRecorderScreenState();
 }
 
 class _CameraRecorderScreenState extends State<CameraRecorderScreen> {
-  late final CameraRecorderController _controller;
   Timer? _statusTimer;
 
+  /// Reads shared camera state for event handlers that do not rebuild the UI.
+  CameraRecorderController get _controller =>
+      context.read<CameraRecorderController>();
+
+  /// Starts periodic polling for pre-roll and save progress.
   @override
   void initState() {
     super.initState();
-    // Platform detection can be overridden when testing with a fake service.
-    _controller = CameraRecorderController(
-      service: widget.cameraService,
-      settings: widget.captureSettings,
-      isAndroidPlatform:
-          widget.isAndroidPlatform ??
-          defaultTargetPlatform == TargetPlatform.android,
-    )..addListener(_onControllerChanged);
-    unawaited(_controller.initialize());
-    _statusTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    _statusTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
       if (!mounted) return;
       if (_controller.isBuffering &&
           !_controller.isCapturingSos &&
@@ -51,26 +35,24 @@ class _CameraRecorderScreenState extends State<CameraRecorderScreen> {
               _controller.settings.preEventDurationSeconds) {
         unawaited(_controller.refreshBufferingStatus());
       }
-      if (_controller.isCapturingSos) setState(() {});
+      if (_controller.isCapturingSos) {
+        unawaited(_controller.refreshSosProgress());
+      }
     });
   }
 
+  /// Stops the screen timer; Provider releases the shared controller separately.
   @override
   void dispose() {
     _statusTimer?.cancel();
-    _controller.removeListener(_onControllerChanged);
-    unawaited(_controller.close());
     super.dispose();
-  }
-
-  void _onControllerChanged() {
-    if (mounted) setState(() {});
   }
 
   /// Shows a responsive camera grid and a fixed recording control panel.
   @override
   Widget build(BuildContext context) {
-    if (!_controller.isAndroidPlatform) {
+    final controller = context.watch<CameraRecorderController>();
+    if (!controller.isAndroidPlatform) {
       return const _UnsupportedPlatformScreen();
     }
     return Scaffold(
@@ -81,7 +63,7 @@ class _CameraRecorderScreenState extends State<CameraRecorderScreen> {
         ),
         actions: [
           IconButton(
-            tooltip: 'Refresh cameras',
+            tooltip: 'Refresh available phone and USB cameras',
             onPressed: _controller.isBusy || _controller.isBuffering
                 ? null
                 : _controller.initialize,
@@ -91,14 +73,14 @@ class _CameraRecorderScreenState extends State<CameraRecorderScreen> {
         ],
       ),
       body: SafeArea(
-        child: _controller.isLoading
+        child: controller.isLoading
             ? const Center(child: CircularProgressIndicator())
             : Column(
                 children: [
                   Expanded(
-                    child: _controller.cameras.isEmpty
+                    child: controller.cameras.isEmpty
                         ? EmptyCameraState(
-                            message: _controller.message ?? 'No cameras found. Connect a supported USB camera and refresh.',
+                            message: controller.message ?? 'No cameras found. Connect a supported USB camera and refresh.',
                             onRefresh: _controller.initialize,
                           )
                         : _cameraGrid(),
@@ -124,8 +106,9 @@ class _CameraRecorderScreenState extends State<CameraRecorderScreen> {
                   children: [
                     Expanded(
                       child: Text(
-                        '${_controller.cameras.length} camera'
-                        '${_controller.cameras.length == 1 ? '' : 's'} detected',
+                        '${_controller.cameras.length} available camera'
+                        '${_controller.cameras.length == 1 ? '' : 's'} · '
+                            'phone and Camera2 USB devices',
                         style: Theme.of(context).textTheme.titleMedium
                             ?.copyWith(fontWeight: FontWeight.w600),
                       ),
@@ -214,8 +197,10 @@ class _CameraRecorderScreenState extends State<CameraRecorderScreen> {
           Text(
             _controller.isBuffering
                 ? _controller.isCapturingSos
-                      ? 'SOS capture active · '
-                            '${_controller.sosSecondsRemaining} seconds remaining'
+                      ? _controller.sosSecondsRemaining > 0
+                            ? 'SOS capture active · '
+                                  '${_controller.sosSecondsRemaining} seconds remaining'
+                            : 'Saving SOS videos…'
                       : 'Rolling ${_controller.settings.segmentDurationSeconds}-second '
                             'segments · ${_controller.availablePreEventSeconds}/'
                             '${_controller.settings.preEventDurationSeconds} pre-event seconds'
@@ -226,6 +211,37 @@ class _CameraRecorderScreenState extends State<CameraRecorderScreen> {
               color: Theme.of(context).colorScheme.onSurfaceVariant,
             ),
           ),
+          if (_controller.recordingHistory.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Saved ${_controller.recordingHistory.length} SOS capture'
+              '${_controller.recordingHistory.length == 1 ? '' : 's'} · latest: '
+              '${_controller.recordingHistory.last.map((recording) => recording.cameraId).join(', ')}',
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+          if (_controller.isCapturingSos) ...[
+            const SizedBox(height: 10),
+            LinearProgressIndicator(
+              value: _controller.sosProgress / 100,
+              minHeight: 6,
+              borderRadius: BorderRadius.circular(8),
+              semanticsLabel: 'SOS video saving progress',
+            ),
+            const SizedBox(height: 5),
+            Text(
+              '${_controller.sosProgress}% · Saving camera videos',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
           const SizedBox(height: 12),
           if (!_controller.isBuffering)
             FilledButton.icon(
@@ -277,7 +293,7 @@ class _CameraRecorderScreenState extends State<CameraRecorderScreen> {
                   : const Icon(Icons.sos_rounded),
               label: Text(
                 _controller.isCapturingSos
-                    ? 'SAVING SOS · ${_controller.sosSecondsRemaining}s'
+                    ? 'SAVING SOS · ${_controller.sosProgress}%'
                     : 'SOS · ${_controller.availablePreEventSeconds}s BEFORE + '
                           '${_controller.settings.postEventDurationSeconds}s AFTER',
                 style: const TextStyle(
@@ -301,6 +317,7 @@ class _CameraRecorderScreenState extends State<CameraRecorderScreen> {
 class _UnsupportedPlatformScreen extends StatelessWidget {
   const _UnsupportedPlatformScreen();
 
+  /// Explains that native camera recording is currently Android-only.
   @override
   Widget build(BuildContext context) {
     return const Scaffold(
